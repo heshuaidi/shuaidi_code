@@ -1,0 +1,276 @@
+【Codex 工程规格】FECP Report Generator（Java 21 + Spring Boot, REST触发, KISS+SOLID）
+目标：Generator 作为 REST 服务运行。外部系统（订阅/触发方）在 NAS 上创建报告目录并写入 inputs/request.json（+可选 rules.json），然后 POST 触发 Generator 生成/更新该报告目录下的 raw/out/meta 文件。
+关键原则：
+- 不依赖旧系统模块/目录结构；只依赖 NAS folder + request.json schemaVersion。
+- 不扫描/列举目录；只处理调用方明确传入的 reportDir（按路径精确命中）。
+- “僵尸锁”：lock 文件存在即永久拒绝并返回 409，人工清理。
+- KISS：不做断点续跑/复杂幂等；只做两级判断：Raw 是否需重抓（watermark），Out 是否需重算（hash+watermark）。
+- 所有文件写入采用 tmp->atomic rename（避免半文件）。
+
+========================================================
+1) NAS 目录规范（方案A：按日期分层）
+========================================================
+reportDir 统一为：
+{NAS_ROOT}/fecp/{reportType}/YYYY/MM/DD/{reportId}/
+
+其中：
+- reportType ∈ {INLINE, DEFECT, WAT, CP}
+- YYYY/MM/DD：按 createdAt（或触发时间）对应日期（Asia/Tokyo）
+- reportId：调用方生成，建议 “yyyyMMdd_HHmmss_<shortRandom>” 或 UUID，需保证同一天内唯一
+
+reportDir 内部结构（单报告自包含）：
+{reportDir}/
+  meta/
+    lock                    # 僵尸锁：存在即拒绝
+    status.json             # RUNNING/SUCCESS/FAILED/SKIPPED
+    report.json             # reportKey、rulesHash、watermarkSnapshot、schemaVersion、generatorVersion...
+  inputs/
+    request.json
+    rules.json              # 可选
+  raw/
+    watermark.json
+    wafer_raw.csv
+    site_raw.csv            # 可选（bySite 才有）
+  out/
+    hc.csv
+    trend.csv
+    box.csv
+    longterm.csv
+
+外部系统负责：
+- mkdir -p 创建 reportDir 及 inputs/ 子目录
+- 写入 inputs/request.json（必须）和 inputs/rules.json（可选）
+- POST /api/v1/reports/run 触发
+
+Generator 负责：
+- 创建 meta/raw/out 目录（若不存在）
+- 写 lock/status/report/watermark/raw/out
+
+========================================================
+2) REST API 规范（DTO）
+========================================================
+
+2.1 触发接口（异步为默认）
+POST /api/v1/reports/run
+Content-Type: application/json
+
+RunReportRequest DTO：
+{
+  "reportType": "WAT",                       // 必填，INLINE/DEFECT/WAT/CP
+  "reportDir": "/nas/fecp/WAT/2026/03/02/20260302_101530_4f3c2a",  // 必填
+  "mode": "NORMAL"                           // 可选：NORMAL（默认）/FORCE_REBUILD
+}
+
+返回：
+- 202 Accepted：受理成功（立即返回）
+  RunReportResponse：
+  {
+    "jobRunId": "20260302-101530-4f3c2a",
+    "status": "RUNNING",
+    "reportDir": "...",
+    "message": "Accepted"
+  }
+
+- 409 Conflict：lock 已存在（僵尸锁策略：直接拒绝）
+  {
+    "errorCode": "LOCKED",
+    "message": "report is locked, manual cleanup required",
+    "reportDir": "..."
+  }
+
+- 400 Bad Request：路径校验失败 / inputs/request.json 缺失或 JSON 不合法
+- 500 Internal Server Error：未预期错误（同时 status.json 写 FAILED）
+
+2.2 查询状态
+GET /api/v1/reports/status?reportDir=...
+返回 meta/status.json 内容（如果不存在返回 404）
+
+========================================================
+3) FileStore 路径校验规则（必须实现）
+========================================================
+
+配置：
+app.nasRoot = "/nas"   // 示例，实际由 application.yaml 配置
+
+校验规则：
+A. reportDir 必须是 nasRoot 下路径（防路径穿越）
+- 使用 Path.of(reportDir).normalize()
+- 必须以 Path.of(nasRoot).normalize() 开头，否则 400
+
+B. reportDir 必须匹配日期分层结构（强制，KISS）
+- 期望结构：{nasRoot}/fecp/{reportType}/YYYY/MM/DD/{reportId}
+- 校验：路径段数量、固定段 "fecp" 存在、reportType 段与 DTO.reportType 一致
+- YYYY/MM/DD 必须为合法日期（允许 2026/03/02 这种）
+- reportId 不做格式强制（只要非空且不含路径分隔符）
+
+C. （可选但推荐）与 request.json.createdAt 日期一致性校验
+- 读取 inputs/request.json.createdAt（ISO-8601）
+- 解析成 Asia/Tokyo 日期，与路径 YYYY/MM/DD 比较
+- 不一致：写 status.json warning 字段（默认不拒绝；如需强制则返回 400）
+
+========================================================
+4) meta/raw 文件格式样例（JSON）
+========================================================
+
+4.1 meta/status.json
+{
+  "schemaVersion": "1.0",
+  "jobRunId": "20260302-101530-4f3c2a",
+  "status": "RUNNING",                // RUNNING / SUCCESS / FAILED / SKIPPED
+  "reportType": "WAT",
+  "reportDir": "/nas/fecp/WAT/2026/03/02/20260302_101530_4f3c2a",
+  "startedAt": "2026-03-02T10:15:30+09:00",
+  "finishedAt": null,
+  "summary": {
+    "rawFetch": "PENDING",            // PENDING/DONE/SKIPPED/FAILED
+    "compute": "PENDING",             // PENDING/DONE/SKIPPED/FAILED
+    "reason": ""
+  },
+  "warnings": [],
+  "errors": []                        // 失败时填 [{code,message,stackTraceShort}]
+}
+
+4.2 meta/report.json（记录用于“是否重算”的关键快照）
+{
+  "schemaVersion": "1.0",
+  "generatorVersion": "fecp-gen-0.1.0",
+  "reportType": "WAT",
+  "reportKey": "sha256:....",         // hash(参与计算的 request 字段 + rules + formulaVersion)
+  "requestHash": "sha256:....",       // hash(完整 request.json 原文)
+  "rulesHash": "sha256:....",         // rules.json 不存在则为 "NONE"
+  "watermarkSnapshot": {              // 本次计算时使用的 watermark（复制 raw/watermark.json）
+    "type": "WAT_WAFER_KEY",
+    "value": "1234567890",
+    "asOf": "2026-03-02T10:15:31+09:00"
+  },
+  "outputFiles": {
+    "hc.csv": { "rows": 1200, "bytes": 345678 },
+    "trend.csv": { "rows": 600, "bytes": 123456 }
+  },
+  "lastSuccessAt": "2026-03-02T10:16:08+09:00"
+}
+
+4.3 raw/watermark.json（决定 Raw 是否重抓）
+{
+  "schemaVersion": "1.0",
+  "type": "WAT_WAFER_KEY",            // INLINE_MET_WAFER_KEY / CP_WAFER_KEY / DEFECT_INSPECTION_TIME ...
+  "value": "1234567890",              // 字符串保存，避免长整型/时间格式差异
+  "asOf": "2026-03-02T10:15:31+09:00",
+  "source": "oracle",
+  "details": { "notes": "optional" }
+}
+
+4.4 meta/lock（内容可空或写入 jobRunId + startedAt）
+- 只要文件存在就拒绝（僵尸锁策略）
+
+========================================================
+5) 计算产物 CSV 样例（hc.csv）
+========================================================
+out/hc.csv（建议列）
+metric_id,exp_n,exp_mean,exp_sigma,base_n,base_mean,base_sigma,mr1,mr2,hc2_percent,color
+WAT:VTH,12,1.234,0.012,12,1.231,0.011,1.0032,1.0011,99.57,G
+WAT:IDSAT,12,0.998,0.020,12,1.002,0.018,1.0123,1.0065,98.13,Y
+
+颜色规则：
+- hc2_percent < 95 => R
+- 95 <= hc2_percent < 99 => Y
+- >= 99 => G
+
+HC2/MR1/MR2（倍率型）公式（使用 wafer 口径聚合后的 μ/σ/n）：
+MR1 = exp( (μe-μb)^2 / (4*(σe^2+σb^2)) )
+MR2 = sqrt( (σe^2+σb^2) / (2*σe*σb) )
+HC2% = 100 / (MR1 * MR2)
+
+========================================================
+6) Controller / JobRunner 关键方法签名（Java 21）
+========================================================
+
+6.1 Controller
+@RestController
+@RequestMapping("/api/v1/reports")
+public class ReportController {
+
+  @PostMapping("/run")
+  public ResponseEntity<RunReportResponse> run(@RequestBody RunReportRequest req);
+
+  @GetMapping("/status")
+  public ResponseEntity<StatusDto> status(@RequestParam("reportDir") String reportDir);
+}
+
+DTO（records）
+public record RunReportRequest(String reportType, String reportDir, String mode) {}
+public record RunReportResponse(String jobRunId, String status, String reportDir, String message) {}
+
+6.2 Facade（异步提交）
+public interface GeneratorFacade {
+  RunReportResponse submit(RunReportRequest req);   // 返回 202 payload
+}
+
+6.3 JobRunner（一次执行的模板骨架，必须具备以下步骤）
+public interface JobRunner {
+  void runOnce(String jobRunId, String reportType, Path reportDir, RunMode mode);
+}
+
+RunMode:
+public enum RunMode { NORMAL, FORCE_REBUILD }
+
+6.4 Pipeline（按 reportType 插拔）
+public interface ReportPipeline {
+  String reportType();   // "WAT"/"INLINE"/...
+  Watermark queryCurrentWatermark(RequestModel request);          // 查源库当前水位
+  void fetchRaw(RequestModel request, Path rawDir);               // 生成 wafer_raw.csv / site_raw.csv
+  void computeAndWriteOutputs(RequestModel request, Path rawDir, Path outDir);  // 读 raw 计算 out
+}
+
+6.5 FileStore（NAS 文件操作+校验，必须实现 tmp->rename）
+public interface FileStore {
+  Path validateAndResolveReportDir(String reportType, String reportDirRaw);    // 执行 3) 的校验规则
+  void ensureDirs(Path reportDir);                                             // meta/inputs/raw/out
+  boolean tryCreateLock(Path reportDir, String jobRunId);                      // 原子创建 meta/lock
+  StatusDto readStatus(Path reportDir);                                        // 读 meta/status.json
+  void writeStatusAtomic(Path reportDir, StatusDto status);                    // tmp->rename
+  RequestModel readRequest(Path reportDir);                                    // inputs/request.json
+  Optional<RulesModel> readRules(Path reportDir);                              // inputs/rules.json
+  Optional<Watermark> readWatermark(Path reportDir);                           // raw/watermark.json
+  void writeWatermarkAtomic(Path reportDir, Watermark wm);                     // tmp->rename
+  void writeReportMetaAtomic(Path reportDir, ReportMeta meta);                 // tmp->rename
+  OutputExistence checkOutputs(Path reportDir);                                // out/*.csv 是否齐全
+}
+
+6.6 JobRunner 的核心伪代码（必须遵守）
+runOnce():
+- validate reportDir
+- ensureDirs
+- if !tryCreateLock => throw LockedException (controller 返回 409)
+- writeStatus(RUNNING)
+- load request/rules
+- wmCurrent = pipeline.queryCurrentWatermark(request)
+- wmOld = read raw/watermark.json
+- if mode==FORCE_REBUILD or wmOld missing or wmCurrent != wmOld:
+    pipeline.fetchRaw(request, rawDir)   // 写 wafer_raw.csv/site_raw.csv (tmp->rename)
+    writeWatermark(wmCurrent)
+- computeNeeded = mode==FORCE_REBUILD OR outputs missing OR reportMeta mismatch (rulesHash/reportKey/wmSnapshot)
+- if !computeNeeded:
+    writeStatus(SKIPPED with reason)
+    return
+- pipeline.computeAndWriteOutputs(request, rawDir, outDir) // 写 hc.csv/trend.csv...
+- writeReportMeta(reportKey,rulesHash,wmSnapshot,outputStats)
+- writeStatus(SUCCESS)
+
+注意：lock 不删除（僵尸锁策略）
+
+========================================================
+7) 最低可运行验收（必须通过）
+========================================================
+- Spring Boot 启动成功
+- POST /api/v1/reports/run 指向一个准备好的 reportDir（含 inputs/request.json）：
+  - 第一次：生成 raw/watermark.json + raw/wafer_raw.csv + out/hc.csv + meta/status/report
+  - 第二次（watermark/rules 不变）：返回 SKIPPED（不重抓不重算）
+- lock 存在时：POST 返回 409，且不做任何写入（除了可选日志）
+
+========================================================
+补充约束
+========================================================
+- Generator 禁止列举 {NAS_ROOT}/fecp/{reportType} 目录；只能按 reportDir 精确访问。
+- 所有 JSON/CSV 读写必须是流式/大文件安全方式。
+- 并发：跨 reportDir 可并发；同 reportDir 由 lock 保证不双跑。
